@@ -310,6 +310,13 @@ class SimpleRobotDemo: public SampleRobot {
 	int imagesSinceHitVoltTarget;
 	int onCameraTargetCount;
 
+	// bunch of parameters for art/billy/taylor/benjamin/kevin's spring 2016 dead-reckoning tests
+	float speedControlDistance;
+	float speedControlP;
+	float speedControlForwardValue;
+	float speedControlReverseValue;
+	float speedControlAccelRate;
+	float speedControlSpeedTolerance;
 public:
 	SimpleRobotDemo() :
 #if PRACTICE_ROBOT
@@ -393,6 +400,19 @@ public:
 
 		compressor.Start();
 
+		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 10000);
+		speedControlForwardValue = SmartDashboard::GetNumber("speedControlForwardValue", 0.3);
+		speedControlReverseValue = SmartDashboard::GetNumber("speedControlReverseValue", 0.0);
+		speedControlAccelRate = SmartDashboard::GetNumber("speedControlAccelRate", 1.0);
+		speedControlP = SmartDashboard::GetNumber("speedControlP", 100);
+		speedControlSpeedTolerance = SmartDashboard::GetNumber("speedControlSpeedTolerance", 0.05);
+		SmartDashboard::PutNumber("speedControlDistance", speedControlDistance);
+		SmartDashboard::PutNumber("speedControlForwardValue", speedControlForwardValue);
+		SmartDashboard::PutNumber("speedControlReverseValue", speedControlReverseValue);
+		SmartDashboard::PutNumber("speedControlAccelRate", speedControlAccelRate);
+		SmartDashboard::PutNumber("speedControlP", speedControlP);
+		SmartDashboard::PutNumber("speedControlSpeedTolerance", speedControlSpeedTolerance);
+
 		autoChooser.AddDefault( "Do Nothing", (void *)"1");
 		autoChooser.AddObject( "Touch Outer", (void *)"2");
 		autoChooser.AddObject( "Cross Outer", (void *)"3");
@@ -414,6 +434,7 @@ public:
 		reportSmartDashboard();
 		SmartDashboard::PutNumber("Camera X", 0 );
 		SmartDashboard::PutNumber("Camera Y", 0 );
+
 
 		LiveWindow *plw = LiveWindow::GetInstance();
 		plw->AddActuator( "Turret", "Controller", &turret );
@@ -606,64 +627,134 @@ public:
 	 * IsAutonomous() and return when it returns false.
 	 */
 
-	void Autonomous() {
-		int nAutoMode = atoi( (char const *)autoChooser.GetSelected());
-		int nStartPos = atoi( (char const *)posnChooser.GetSelected());
-		int nDefence = atoi( (char const *)defenseChooser.GetSelected());
-		initailAngle =gyro->GetAngle();
-		myRobot.SetSafetyEnabled( false );
+	int encCalls;
+	int driveCalls;
+	class EncoderLink: public PIDSource
+	{
+	public:
+		EncoderLink(SimpleRobotDemo* me) : me(me) {};
+		double PIDGet(){
+			me->encCalls++;
+			int ret= (me->leftencoder.GetRaw()+me->rightencoder.GetRaw())/2;
 
-
-
-		printf( "Entering Auton: %d / %d / %d\n", nAutoMode, nStartPos, nDefence );
-		lowShifter.Set(true);
-		highShifter.Set(false);
-		int shiftEndTime = GetFPGATime() + 250000;
-		while (IsAutonomous() && IsEnabled() && shiftEndTime > GetFPGATime()) {
-			//wait for shifter to shift
-			Wait(0.005);
+			return ret;
 		}
-		lowShifter.Set(false);
-		switch( nAutoMode )
+
+	private:
+		SimpleRobotDemo* me;
+
+	};
+
+	class DriveLink: public PIDOutput
+	{
+	public:
+		DriveLink(SimpleRobotDemo* me) : me(me) {};
+		void PIDWrite(float output){
+			me->driveCalls++;
+			me->myRobot.ArcadeDrive(output,0,false);
+		}
+
+	private:
+		SimpleRobotDemo* me;
+	};
+
+	void Autonomous() {
+		leftencoder.Reset();
+		rightencoder.Reset();
+		float p = 0.0005;
+		float i = 0;
+		float d = 0;
+
+
+
+		int c=0;
+		encCalls = 0;
+		driveCalls = 0;
+
+		myRobot.SetSafetyEnabled(false);
+
+		EncoderLink enclnk(this);
+
+
+		DriveLink drvlnk(this);
+
+		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 10000);
+		speedControlForwardValue = SmartDashboard::GetNumber("speedControlForwardValue", 0.3);
+		speedControlReverseValue = SmartDashboard::GetNumber("speedControlReverseValue", 0.0);
+		speedControlAccelRate = SmartDashboard::GetNumber("speedControlAccelRate", 1.0);
+		speedControlP = SmartDashboard::GetNumber("speedControlP", 100);
+		speedControlSpeedTolerance = SmartDashboard::GetNumber("speedControlSpeedTolerance", 0.05);
+
+		const int targetticks = enclnk.PIDGet() + speedControlDistance;
+
+		PIDController pid(p, i, d, &enclnk, &drvlnk);
+		pid.SetSetpoint(targetticks);
+		pid.SetAbsoluteTolerance(150);
+		//pid.Enable();
+		int startTime = GetFPGATime();
+
+		int lastTime = GetFPGATime();
+		int lastTicks = enclnk.PIDGet();
+		while (IsAutonomous()&& IsEnabled())
 		{
-		case 1:
-			break;
-		case 2:
-			TouchOuterworks( nDefence );
-			break;
-		case 3:
-			CrossOuterworks( nDefence );
-			break;
-		case 4:
-			switch( nStartPos ){
-				case 2:
-				CrossOuterworks( nDefence );
-				DriveForward(.75, 4);
-				Turn(30);
-				AutonomousScore();
-				break;
-			case 3:
-				CrossOuterworks(nDefence);
-				Turn(10);
-				AutonomousScore();
-				break;
-			case 4:
-				CrossOuterworks(nDefence);
-				AutonomousScore();
-				break;
-			case 5:
-				CrossOuterworks(nDefence);
-				Turn(-10);
-				AutonomousScore();
+			Wait(.005);
+			const float tickspermeter = 6351;
+			const int currentTime = GetFPGATime();
+			const int timeChangeMicrosec = currentTime - lastTime;
+			if(timeChangeMicrosec <= 0)
+			{
+				// no time has changed... yet
+				Wait(.005);
+				continue;
+			}
+			const float deltaSeconds = ((float)timeChangeMicrosec / 1000000.0f);
+
+			const int currentTicks = enclnk.PIDGet();
+			const int tickDelta = currentTicks - lastTicks;
+			const float metersDelta = (float)tickDelta / tickspermeter;
+			const float curspeed = metersDelta / deltaSeconds;
+
+			// update "lasts"
+			lastTime = currentTime;
+			lastTicks = currentTicks;
+
+			float disttotarget = fabs(targetticks - enclnk.PIDGet());
+
+			const float absCurSpeed = fabs(curspeed);
+			if (disttotarget < 50 && absCurSpeed < speedControlSpeedTolerance)
+			{
+				int endTime= GetFPGATime();
+				printf("time %d  current pos %d, speed %fm/s  %f\n", endTime-startTime, currentTicks, absCurSpeed, speedControlSpeedTolerance);
 				break;
 			}
-			break;
-		}
 
-		while (IsAutonomous() && IsEnabled()) {
-			Wait(0.005);
+			const float maxa = speedControlAccelRate;
+			const float meterstogo = disttotarget/tickspermeter;
+			float maxspeed = sqrt(2*maxa*meterstogo);
+
+			if(currentTicks > targetticks)
+			{
+				maxspeed = maxspeed * -1;
+			}
+
+			if(curspeed < maxspeed)
+			{
+				myRobot.ArcadeDrive(speedControlForwardValue,0.0,false);
+			}
+			else
+			{
+				myRobot.ArcadeDrive(speedControlReverseValue,0.0,false);
+			}
+
+			c++;
+			if(c%20==0)
+			{
+				printf("max speed %f cur speed %f meters to go %f\n", maxspeed, curspeed, meterstogo);
+			}
 		}
-		myRobot.SetSafetyEnabled( true );
+		pid.Disable();
+		Wait(0.25);
+		myRobot.ArcadeDrive(0.0,0.0);
 	}
 
 	void Test()
@@ -1110,7 +1201,7 @@ int receivePacket() {
 		networkCount++;
 		dataRecv.x = (dataRecv.x);
 		dataRecv.y = (dataRecv.y);
-		printf("net: %d %d \n",dataRecv.x ,dataRecv.y);
+		//printf("net: %d %d \n",dataRecv.x ,dataRecv.y);
 
 		{
 			ACQUIRE_MUTEX();

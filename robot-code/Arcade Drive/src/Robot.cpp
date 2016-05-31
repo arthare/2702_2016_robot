@@ -8,6 +8,66 @@
 #include <math.h>
 #include <mutex>
 
+
+class SmoothMotionManager
+{
+float lastPos;
+float lastTime;
+
+public:
+	SmoothMotionManager(float initialPos, float time):lastPos(initialPos),
+													lastTime(time)
+	{
+
+	}
+	bool tick(const float currentPos,
+					const float targetPos,
+					const float powerIfUnder,
+					const float powerIfOver,
+					const float accelRate,
+					const float currentTime,
+					const float stoppingSpeedTolerance,
+					const float stoppingDistanceTolerance,
+					float* powerOutput)
+	{
+		const float deltaTime = currentTime - lastTime;
+		lastTime = currentTime;
+
+		const float distToTarget = fabs(targetPos - currentPos);
+
+		if (deltaTime == 0){
+			return false;
+		}
+		const float curSpeed = (currentPos - lastPos)/deltaTime;
+		lastPos = currentPos;
+
+		const float absCurSpeed = fabs(curSpeed);
+		if (distToTarget < stoppingDistanceTolerance && absCurSpeed < stoppingSpeedTolerance)
+		{
+			return true;
+		}
+
+		const float maxa = accelRate;
+		float targetSpeed = sqrt(2*maxa*distToTarget);
+
+		if(currentPos > targetPos)
+		{
+			targetSpeed = targetSpeed * -1;
+		}
+
+		if(curSpeed < targetSpeed)
+		{
+			*powerOutput = powerIfUnder;
+		}
+		else
+		{
+			*powerOutput = powerIfOver;
+		}
+		return false;
+	}
+};
+
+
 class SimpleRobotDemo;
 void receiveTask(SimpleRobotDemo *myRobot);
 int receivePacket();
@@ -400,7 +460,7 @@ public:
 
 		compressor.Start();
 
-		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 10000);
+		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 1.5);
 		speedControlForwardValue = SmartDashboard::GetNumber("speedControlForwardValue", 0.3);
 		speedControlReverseValue = SmartDashboard::GetNumber("speedControlReverseValue", 0.0);
 		speedControlAccelRate = SmartDashboard::GetNumber("speedControlAccelRate", 1.0);
@@ -629,15 +689,17 @@ public:
 
 	int encCalls;
 	int driveCalls;
-	class EncoderLink: public PIDSource
+	class EncoderLink
 	{
 	public:
 		EncoderLink(SimpleRobotDemo* me) : me(me) {};
-		double PIDGet(){
+		double PIDGet() const{
 			me->encCalls++;
 			int ret= (me->leftencoder.GetRaw()+me->rightencoder.GetRaw())/2;
 
-			return ret;
+			const float tickspermeter = 6351;
+			const float retInMeters = (float)ret / tickspermeter;
+			return retInMeters;
 		}
 
 	private:
@@ -661,11 +723,6 @@ public:
 	void Autonomous() {
 		leftencoder.Reset();
 		rightencoder.Reset();
-		float p = 0.0005;
-		float i = 0;
-		float d = 0;
-
-
 
 		int c=0;
 		encCalls = 0;
@@ -678,83 +735,74 @@ public:
 
 		DriveLink drvlnk(this);
 
-		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 10000);
+		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 1.5);
 		speedControlForwardValue = SmartDashboard::GetNumber("speedControlForwardValue", 0.3);
 		speedControlReverseValue = SmartDashboard::GetNumber("speedControlReverseValue", 0.0);
 		speedControlAccelRate = SmartDashboard::GetNumber("speedControlAccelRate", 1.0);
 		speedControlP = SmartDashboard::GetNumber("speedControlP", 100);
 		speedControlSpeedTolerance = SmartDashboard::GetNumber("speedControlSpeedTolerance", 0.05);
 
-		const int targetticks = enclnk.PIDGet() + speedControlDistance;
-
-		PIDController pid(p, i, d, &enclnk, &drvlnk);
-		pid.SetSetpoint(targetticks);
-		pid.SetAbsoluteTolerance(150);
+		const float targetMeters = enclnk.PIDGet() + speedControlDistance;
 		//pid.Enable();
-		int startTime = GetFPGATime();
 
-		int lastTime = GetFPGATime();
-		int lastTicks = enclnk.PIDGet();
+		SmoothMotionManager robotDistance(enclnk.PIDGet(),(float)GetFPGATime()/1000000.0f);
 		while (IsAutonomous()&& IsEnabled())
 		{
 			Wait(.005);
-			const float tickspermeter = 6351;
-			const int currentTime = GetFPGATime();
-			const int timeChangeMicrosec = currentTime - lastTime;
-			if(timeChangeMicrosec <= 0)
-			{
-				// no time has changed... yet
-				Wait(.005);
-				continue;
-			}
-			const float deltaSeconds = ((float)timeChangeMicrosec / 1000000.0f);
+			const float currentTime =(float) GetFPGATime()/1000000.0f;
+			float motorPower = 0;
+			bool finished = robotDistance.tick(enclnk.PIDGet(),
+					targetMeters,
+					speedControlForwardValue,
+					speedControlReverseValue,
+					speedControlAccelRate,
+					currentTime,
+					speedControlSpeedTolerance,
+					0.015,
+					&motorPower);
 
-			const int currentTicks = enclnk.PIDGet();
-			const int tickDelta = currentTicks - lastTicks;
-			const float metersDelta = (float)tickDelta / tickspermeter;
-			const float curspeed = metersDelta / deltaSeconds;
-
-			// update "lasts"
-			lastTime = currentTime;
-			lastTicks = currentTicks;
-
-			float disttotarget = fabs(targetticks - enclnk.PIDGet());
-
-			const float absCurSpeed = fabs(curspeed);
-			if (disttotarget < 50 && absCurSpeed < speedControlSpeedTolerance)
-			{
-				int endTime= GetFPGATime();
-				printf("time %d  current pos %d, speed %fm/s  %f\n", endTime-startTime, currentTicks, absCurSpeed, speedControlSpeedTolerance);
+			if(finished) {
 				break;
 			}
-
-			const float maxa = speedControlAccelRate;
-			const float meterstogo = disttotarget/tickspermeter;
-			float maxspeed = sqrt(2*maxa*meterstogo);
-
-			if(currentTicks > targetticks)
-			{
-				maxspeed = maxspeed * -1;
-			}
-
-			if(curspeed < maxspeed)
-			{
-				myRobot.ArcadeDrive(speedControlForwardValue,0.0,false);
-			}
-			else
-			{
-				myRobot.ArcadeDrive(speedControlReverseValue,0.0,false);
-			}
-
+			myRobot.ArcadeDrive(motorPower, 0, false);
 			c++;
-			if(c%20==0)
+			if(c % 20 == 0)
 			{
-				printf("max speed %f cur speed %f meters to go %f\n", maxspeed, curspeed, meterstogo);
+				printf("targeted motor power was %.2f \n", motorPower);
 			}
 		}
-		pid.Disable();
-		Wait(0.25);
 		myRobot.ArcadeDrive(0.0,0.0);
+
+
+		const float targetAngle = this->gyro->GetAngle() + 180;
+		SmoothMotionManager robotTurn(this->gyro->GetAngle(),(float)GetFPGATime()/1000000.0f);
+		while (IsAutonomous()&& IsEnabled())
+		{
+			Wait(.005);
+			const float currentTime =(float) GetFPGATime()/1000000.0f;
+			float motorPower = 0;
+			bool finished = robotTurn.tick(this->gyro->GetAngle(),
+					targetAngle,
+					1,
+					-1,
+					1000,
+					currentTime,
+					0.1,
+					0.5,
+					&motorPower);
+
+			if(finished) {
+				break;
+			}
+			myRobot.ArcadeDrive(0, motorPower, false);
+			c++;
+			if(c % 20 == 0)
+			{
+				printf("turning: targeted motor power was %.2f \n", motorPower);
+			}
+		}
+		myRobot.ArcadeDrive(0.0,0.0);
+		Wait(0.25);
 	}
 
 	void Test()
@@ -976,7 +1024,9 @@ public:
 				shooterSpeed = 0.55;
 			}
 
-			myRobot.ArcadeDrive(driveStick); // drive with arcade style (use right stick)
+			float kidMode = (driveStick.GetZ()+1)/2;
+			printf("kidMode = %f\n", kidMode);
+			myRobot.ArcadeDrive(driveStick.GetY() * kidMode, driveStick.GetX() * kidMode); // drive with arcade style (use right stick)
 			static int highStartedAt = GetFPGATime();
 			static int lowStartedAt = GetFPGATime();
 			static bool wasPressedLast = false;

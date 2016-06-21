@@ -32,6 +32,7 @@ const int ARM_DOWN_BUTTON=8;
 const int RECENTER_BUTTON = 9;
 const int SHOOTER_REV_BUTTON=10; //reverse
 const int SHOOTER_FWD_BUTTON=11; //forward
+const int KEEP_CALIBRATING=3;
 
 
 #if PRACTICE_ROBOT

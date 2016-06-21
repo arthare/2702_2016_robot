@@ -7,18 +7,130 @@
 #include <unistd.h>
 #include <math.h>
 #include <mutex>
+#include <deque>
+using namespace std;
 
+float blendNum(float x, float y, float blendToY, float max, float min)
+{
+	float ret = (1-blendToY)*x + blendToY*y;
+	if (ret < min)
+	{
+		ret = min;
+	}
+	if (ret > max)
+	{
+		ret = max;
+	}
+	return ret;
+}
+
+struct timeDistance
+{
+  float time;
+  float distance;
+};
+
+float getSpeedOfPoints(const deque<timeDistance>& data)
+{
+  //using https://en.wikipedia.org/wiki/Simple_linear_regression
+
+  float timeAvg = 0;
+  float distAvg = 0;
+
+  for(deque<timeDistance>::const_iterator i = data.begin(); i != data.end(); i++){
+    const timeDistance pt = *i;
+    timeAvg += pt.time;
+    distAvg += pt.distance;
+  }
+
+  timeAvg = timeAvg / data.size();
+  distAvg = distAvg / data.size();
+
+  float top = 0;
+  float bottom = 0;
+
+  for(deque<timeDistance>::const_iterator i = data.begin(); i != data.end(); i++){
+    const timeDistance pt = *i;
+    top += (pt.distance - distAvg)*(pt.time - timeAvg);
+    bottom += pow((pt.time - timeAvg),2);
+  }
+
+  float beta = top/bottom;
+
+  return beta;
+
+}
 
 class SmoothMotionManager
 {
 float lastPos;
 float lastTime;
+deque<timeDistance> recordedData;
 
 public:
 	SmoothMotionManager(float initialPos, float time):lastPos(initialPos),
 													lastTime(time)
 	{
 
+	}
+
+	// MechModel: a quick class so that callers to tick() can represent a speed->motorpower "model".
+	// input: the speed you want to achieve
+	// output: the motor power that achieves that speed in steady-state driving.
+	// tip: use the SMoothMotionCalibrationSensors class and the SmoothMotionManager::Calibrate() function to help you build this model
+	class MechModel
+	{
+		public:
+			virtual float GetMotorPowerForSpeed(float targetSpeed) = 0;
+			//returns how many seconds it takes for a motor command to happen in real life
+			virtual float GetMechanicalLag() = 0;
+	};
+	class SmoothMotionCalibrationSensors
+	{
+	public:
+		virtual float GetSensorReading() = 0;
+		virtual bool ShouldContinueCalibration() = 0;
+		virtual void SetMotorPower(float power) = 0;
+		virtual float GetTestSpeed(int step) = 0;
+	};
+
+	void calibrate(SmoothMotionCalibrationSensors* calibrateSensors){
+		for(int i = 0; i < 5 && calibrateSensors->ShouldContinueCalibration(); i++){
+			float motorPower = calibrateSensors->GetTestSpeed(i);
+			float sensorReadingBefore = calibrateSensors->GetSensorReading();
+			calibrateSensors->SetMotorPower(motorPower);
+
+			const int secondsToTest = 2;
+			int startTime = GetFPGATime();
+			int endTime = GetFPGATime() + secondsToTest * 1000000;
+			while(calibrateSensors->ShouldContinueCalibration() && GetFPGATime() < endTime) {
+				calibrateSensors->SetMotorPower(motorPower);
+				Wait(0.01);
+			}
+
+			float sensorReadingAfter = calibrateSensors->GetSensorReading();
+			float sensorDelta = sensorReadingAfter-sensorReadingBefore;
+			float sensorRate = sensorDelta/2;
+			printf("%.2f \t %.2f \n", motorPower, sensorRate);
+		}
+		calibrateSensors->SetMotorPower(0);
+	}
+
+	float computeCurrentSpeed()
+	{
+		float slope = getSpeedOfPoints(recordedData);
+		return slope;
+	}
+	void recordData(float time, float distance)
+	{
+		const float keepTime = 0.05;
+		timeDistance pt;
+		pt.time = time;
+		pt.distance = distance;
+		recordedData.push_back(pt);
+		while(recordedData.size() > 0 && recordedData.front().time < time-keepTime){
+			recordedData.pop_front();
+		}
 	}
 	bool tick(const float currentPos,
 					const float targetPos,
@@ -28,7 +140,9 @@ public:
 					const float currentTime,
 					const float stoppingSpeedTolerance,
 					const float stoppingDistanceTolerance,
-					float* powerOutput)
+					const float blendGap,
+					float* powerOutput,
+					MechModel* mechModel)
 	{
 		const float deltaTime = currentTime - lastTime;
 		lastTime = currentTime;
@@ -38,7 +152,8 @@ public:
 		if (deltaTime == 0){
 			return false;
 		}
-		const float curSpeed = (currentPos - lastPos)/deltaTime;
+		const float curSpeed = computeCurrentSpeed();
+		recordData(currentTime, currentPos);
 		lastPos = currentPos;
 
 		const float absCurSpeed = fabs(curSpeed);
@@ -48,23 +163,49 @@ public:
 		}
 
 		const float maxa = accelRate;
-		float targetSpeed = sqrt(2*maxa*distToTarget);
-
-		if(currentPos > targetPos)
+		float futurePos = currentPos + (mechModel->GetMechanicalLag()*curSpeed);
+		float futureDistToTarget = targetPos-futurePos;
+		float targetSpeed = sqrt(2*maxa*abs(futureDistToTarget));
+		const float gap = blendGap;
+		if(futurePos > targetPos)
 		{
 			targetSpeed = targetSpeed * -1;
 		}
 
-		if(curSpeed < targetSpeed)
+		if(curSpeed < targetSpeed-gap)
 		{
 			*powerOutput = powerIfUnder;
+		}
+		else if(curSpeed >= targetSpeed-gap && curSpeed <= targetSpeed )
+		{
+			const float min = targetSpeed - gap;
+			const float max = targetSpeed;
+			float blend = (curSpeed-min)/(max-min);
+			//blending from max power and the movement model
+			*powerOutput = blendNum(powerIfUnder,mechModel->GetMotorPowerForSpeed(targetSpeed),blend,powerIfUnder,powerIfOver);
+		}
+		else if(curSpeed <= targetSpeed+gap && curSpeed > targetSpeed )
+		{
+			const float min = targetSpeed;
+			const float max = targetSpeed + gap;
+			float blend = (curSpeed-min)/(max-min);
+			//blending from max power and the movement model
+			*powerOutput = blendNum(mechModel->GetMotorPowerForSpeed(targetSpeed),powerIfOver,blend,powerIfUnder,powerIfOver);
 		}
 		else
 		{
 			*powerOutput = powerIfOver;
 		}
+		printf("%.2f \t %.2f \t %.2f \t %.2f \t %.2f  %.2f \n",
+					*powerOutput,
+					currentTime,
+					curSpeed,
+					currentPos,
+					targetSpeed,
+					futurePos);
 		return false;
 	}
+
 };
 
 
@@ -374,6 +515,7 @@ class SimpleRobotDemo: public SampleRobot {
 	float speedControlDistance;
 	float speedControlP;
 	float speedControlForwardValue;
+	float speedControlTargetGap;
 	float speedControlReverseValue;
 	float speedControlAccelRate;
 	float speedControlSpeedTolerance;
@@ -462,12 +604,14 @@ public:
 
 		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 1.5);
 		speedControlForwardValue = SmartDashboard::GetNumber("speedControlForwardValue", 0.3);
+		speedControlTargetGap = SmartDashboard::GetNumber("speedControlTargetGap", 30);
 		speedControlReverseValue = SmartDashboard::GetNumber("speedControlReverseValue", 0.0);
 		speedControlAccelRate = SmartDashboard::GetNumber("speedControlAccelRate", 1.0);
 		speedControlP = SmartDashboard::GetNumber("speedControlP", 100);
 		speedControlSpeedTolerance = SmartDashboard::GetNumber("speedControlSpeedTolerance", 0.05);
 		SmartDashboard::PutNumber("speedControlDistance", speedControlDistance);
 		SmartDashboard::PutNumber("speedControlForwardValue", speedControlForwardValue);
+		SmartDashboard::PutNumber("speedControlTargetGap", speedControlTargetGap);
 		SmartDashboard::PutNumber("speedControlReverseValue", speedControlReverseValue);
 		SmartDashboard::PutNumber("speedControlAccelRate", speedControlAccelRate);
 		SmartDashboard::PutNumber("speedControlP", speedControlP);
@@ -737,6 +881,7 @@ public:
 
 		speedControlDistance = SmartDashboard::GetNumber("speedControlDistance", 1.5);
 		speedControlForwardValue = SmartDashboard::GetNumber("speedControlForwardValue", 0.3);
+		speedControlTargetGap = SmartDashboard::GetNumber("speedControlTargetGap", 30);
 		speedControlReverseValue = SmartDashboard::GetNumber("speedControlReverseValue", 0.0);
 		speedControlAccelRate = SmartDashboard::GetNumber("speedControlAccelRate", 1.0);
 		speedControlP = SmartDashboard::GetNumber("speedControlP", 100);
@@ -745,12 +890,14 @@ public:
 		const float targetMeters = enclnk.PIDGet() + speedControlDistance;
 		//pid.Enable();
 
+		RobotDriveModel driveModel;
 		SmoothMotionManager robotDistance(enclnk.PIDGet(),(float)GetFPGATime()/1000000.0f);
 		while (IsAutonomous()&& IsEnabled())
 		{
 			Wait(.005);
 			const float currentTime =(float) GetFPGATime()/1000000.0f;
 			float motorPower = 0;
+
 			bool finished = robotDistance.tick(enclnk.PIDGet(),
 					targetMeters,
 					speedControlForwardValue,
@@ -759,7 +906,9 @@ public:
 					currentTime,
 					speedControlSpeedTolerance,
 					0.015,
-					&motorPower);
+					speedControlTargetGap,
+					&motorPower,
+					&driveModel);
 
 			if(finished) {
 				break;
@@ -773,8 +922,9 @@ public:
 		}
 		myRobot.ArcadeDrive(0.0,0.0);
 
-
+/*
 		const float targetAngle = this->gyro->GetAngle() + 180;
+		RobotTurnModel turnModel;
 		SmoothMotionManager robotTurn(this->gyro->GetAngle(),(float)GetFPGATime()/1000000.0f);
 		while (IsAutonomous()&& IsEnabled())
 		{
@@ -783,13 +933,14 @@ public:
 			float motorPower = 0;
 			bool finished = robotTurn.tick(this->gyro->GetAngle(),
 					targetAngle,
-					1,
-					-1,
-					1000,
+					speedControlForwardValue,
+					speedControlReverseValue,
+					speedControlAccelRate,
 					currentTime,
-					0.1,
+					speedControlSpeedTolerance,
 					0.5,
-					&motorPower);
+					&motorPower,
+					&turnModel);
 
 			if(finished) {
 				break;
@@ -798,10 +949,39 @@ public:
 			c++;
 			if(c % 20 == 0)
 			{
-				printf("turning: targeted motor power was %.2f \n", motorPower);
+				//printf("turning: targeted motor power was %.2f \n", motorPower);
+			}
+		}*/
+		myRobot.ArcadeDrive(0, 0, false);
+
+
+		/*SmoothMotionManager turretPosition(turretPot.GetVoltage(),(float)GetFPGATime()/1000000.0f);
+		while (IsAutonomous()&& IsEnabled())
+		{
+			Wait(.005);
+			const float currentTime =(float) GetFPGATime()/1000000.0f;
+			float motorPower = 0;
+			bool finished = turretPosition.tick(turretPot.GetVoltage(),
+					2.0,
+					speedControlForwardValue,
+					speedControlReverseValue,
+					speedControlAccelRate,
+					currentTime,
+					speedControlSpeedTolerance,
+					0.01,
+					&motorPower);
+
+			if(finished) {
+				break;
+			}
+			turretControl(motorPower);
+			c++;
+			if(c % 20 == 0)
+			{
+				printf("targeted motor power was %.2f \n", motorPower);
 			}
 		}
-		myRobot.ArcadeDrive(0.0,0.0);
+		turret.Set(0);*/
 		Wait(0.25);
 	}
 
@@ -885,8 +1065,77 @@ public:
 	/**
 	 * \Runs the motors with arcade steering.
 	 */
+	class RobotTurnModel : public SmoothMotionManager::MechModel
+	{
+	public:
+		virtual float GetMotorPowerForSpeed(float targetSpeed)
+		{
+			return (targetSpeed + 29.8)/154.3;
+		}
+		virtual float GetMechanicalLag()
+		{
+			return 0.07;
+		}
+	};
+	class RobotDriveModel : public SmoothMotionManager::MechModel
+	{
+	public:
+		virtual float GetMotorPowerForSpeed(float targetSpeed)
+		{
+			return (0.543*targetSpeed)+.046;
+		}
+		virtual float GetMechanicalLag()
+		{
+			return 0.07;
+		}
+	};
+	class RobotDriveCalibrator : public SmoothMotionManager::SmoothMotionCalibrationSensors
+	{
+		SimpleRobotDemo* myRobot;
+	public:
+		RobotDriveCalibrator(SimpleRobotDemo* robot):myRobot(robot)
+		{
+		}
+
+		virtual float GetSensorReading() {
+			return (myRobot->leftencoder.GetRaw() + myRobot->rightencoder.GetRaw())/2;
+		}
+		virtual bool ShouldContinueCalibration() {
+			return myRobot->opStick.GetRawButton(KEEP_CALIBRATING);
+		}
+		virtual void SetMotorPower(float power) {
+			myRobot->myRobot.ArcadeDrive(power,0,0);
+		}
+		virtual float GetTestSpeed(int step) {
+			return (step+1)*.2;
+		}
+	};
+	class GyroCalibrator : public SmoothMotionManager::SmoothMotionCalibrationSensors
+	{
+		SimpleRobotDemo* myRobot;
+	public:
+		GyroCalibrator(SimpleRobotDemo* robot):myRobot(robot)
+		{
+		}
+
+		virtual float GetSensorReading() {
+			return myRobot->gyro->GetAngle();
+		}
+		virtual bool ShouldContinueCalibration() {
+			return myRobot->opStick.GetRawButton(KEEP_CALIBRATING);
+		}
+		virtual void SetMotorPower(float power) {
+			myRobot->myRobot.ArcadeDrive(0,power,0);
+		}
+		virtual float GetTestSpeed(int step) {
+			return (step+1)*.2;
+		}
+	};
 	void OperatorControl()
 	{
+		//GyroCalibrator calib(this);
+		RobotDriveCalibrator calib(this);
+
 		int printcnt = 0;
 		bool lastOpButtons[12] = {0};
 		bool lastDriveButtons[12] = {0};
@@ -899,6 +1148,8 @@ public:
 
 		turretController.SetPID(fP,fI,fD);
 		turretController.SetOutputRange( -fPIDMax, fPIDMax );
+		SmoothMotionManager gyroManager(0,0);
+		SmoothMotionManager robotDriveManager(0,0);
 
 		while (IsOperatorControl() && IsEnabled())
 		{
@@ -915,6 +1166,10 @@ public:
 				const bool thisDriveButton = driveStick.GetRawButton(x);
 				driveButtonClicked[x] = (thisDriveButton && !lastDriveButtons[x]);
 				lastDriveButtons[x] = thisDriveButton;
+			}
+
+			if(opStick.GetRawButton(KEEP_CALIBRATING)){
+				robotDriveManager.calibrate(&calib);
 			}
 #if 0
 			if(opButtonClicked[6]) {
@@ -1024,8 +1279,26 @@ public:
 				shooterSpeed = 0.55;
 			}
 
-			float kidMode = (driveStick.GetZ()+1)/2;
-			printf("kidMode = %f\n", kidMode);
+			// turret acceleration measurement code
+			static float lastTurretPos = gyro->GetAngle();
+			static float lastTurretSpeed = 0;
+			static int lastTime = GetFPGATime();
+
+			int curentTime = GetFPGATime();
+
+
+			float dt = (curentTime - lastTime)/1000000.0f;
+			if(dt>0.025)
+			{
+				float thisPos = gyro->GetAngle();
+				float thisSpeed = (thisPos - lastTurretPos)/dt;
+				float thisAcc = (thisSpeed - lastTurretSpeed)/dt;
+				printf("current acelleration  %f \n",thisAcc);
+				lastTurretPos = thisPos;
+				lastTurretSpeed = thisSpeed;
+				lastTime = curentTime;
+			}
+			float kidMode = (-opStick.GetZ()+1)/2;
 			myRobot.ArcadeDrive(driveStick.GetY() * kidMode, driveStick.GetX() * kidMode); // drive with arcade style (use right stick)
 			static int highStartedAt = GetFPGATime();
 			static int lowStartedAt = GetFPGATime();

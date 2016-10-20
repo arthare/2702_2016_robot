@@ -7,207 +7,8 @@
 #include <unistd.h>
 #include <math.h>
 #include <mutex>
-#include <deque>
+#include "SmoothMotionManager.h"
 using namespace std;
-
-float blendNum(float x, float y, float blendToY, float max, float min)
-{
-	float ret = (1-blendToY)*x + blendToY*y;
-	if (ret < min)
-	{
-		ret = min;
-	}
-	if (ret > max)
-	{
-		ret = max;
-	}
-	return ret;
-}
-
-struct timeDistance
-{
-  float time;
-  float distance;
-};
-
-float getSpeedOfPoints(const deque<timeDistance>& data)
-{
-  //using https://en.wikipedia.org/wiki/Simple_linear_regression
-
-  float timeAvg = 0;
-  float distAvg = 0;
-
-  for(deque<timeDistance>::const_iterator i = data.begin(); i != data.end(); i++){
-    const timeDistance pt = *i;
-    timeAvg += pt.time;
-    distAvg += pt.distance;
-  }
-
-  timeAvg = timeAvg / data.size();
-  distAvg = distAvg / data.size();
-
-  float top = 0;
-  float bottom = 0;
-
-  for(deque<timeDistance>::const_iterator i = data.begin(); i != data.end(); i++){
-    const timeDistance pt = *i;
-    top += (pt.distance - distAvg)*(pt.time - timeAvg);
-    bottom += pow((pt.time - timeAvg),2);
-  }
-
-  float beta = top/bottom;
-
-  return beta;
-
-}
-
-class SmoothMotionManager
-{
-float lastPos;
-float lastTime;
-deque<timeDistance> recordedData;
-
-public:
-	SmoothMotionManager(float initialPos, float time):lastPos(initialPos),
-													lastTime(time)
-	{
-
-	}
-
-	// MechModel: a quick class so that callers to tick() can represent a speed->motorpower "model".
-	// input: the speed you want to achieve
-	// output: the motor power that achieves that speed in steady-state driving.
-	// tip: use the SMoothMotionCalibrationSensors class and the SmoothMotionManager::Calibrate() function to help you build this model
-	class MechModel
-	{
-		public:
-			virtual float GetMotorPowerForSpeed(float targetSpeed) = 0;
-			//returns how many seconds it takes for a motor command to happen in real life
-			virtual float GetMechanicalLag() = 0;
-	};
-	class SmoothMotionCalibrationSensors
-	{
-	public:
-		virtual float GetSensorReading() = 0;
-		virtual bool ShouldContinueCalibration() = 0;
-		virtual void SetMotorPower(float power) = 0;
-		virtual float GetTestSpeed(int step) = 0;
-	};
-
-	void calibrate(SmoothMotionCalibrationSensors* calibrateSensors){
-		for(int i = 0; i < 5 && calibrateSensors->ShouldContinueCalibration(); i++){
-			float motorPower = calibrateSensors->GetTestSpeed(i);
-			float sensorReadingBefore = calibrateSensors->GetSensorReading();
-			calibrateSensors->SetMotorPower(motorPower);
-
-			const int secondsToTest = 2;
-			int startTime = GetFPGATime();
-			int endTime = GetFPGATime() + secondsToTest * 1000000;
-			while(calibrateSensors->ShouldContinueCalibration() && GetFPGATime() < endTime) {
-				calibrateSensors->SetMotorPower(motorPower);
-				Wait(0.01);
-			}
-
-			float sensorReadingAfter = calibrateSensors->GetSensorReading();
-			float sensorDelta = sensorReadingAfter-sensorReadingBefore;
-			float sensorRate = sensorDelta/2;
-			printf("%.2f \t %.2f \n", motorPower, sensorRate);
-		}
-		calibrateSensors->SetMotorPower(0);
-	}
-
-	float computeCurrentSpeed()
-	{
-		float slope = getSpeedOfPoints(recordedData);
-		return slope;
-	}
-	void recordData(float time, float distance)
-	{
-		const float keepTime = 0.05;
-		timeDistance pt;
-		pt.time = time;
-		pt.distance = distance;
-		recordedData.push_back(pt);
-		while(recordedData.size() > 0 && recordedData.front().time < time-keepTime){
-			recordedData.pop_front();
-		}
-	}
-	bool tick(const float currentPos,
-					const float targetPos,
-					const float powerIfUnder,
-					const float powerIfOver,
-					const float accelRate,
-					const float currentTime,
-					const float stoppingSpeedTolerance,
-					const float stoppingDistanceTolerance,
-					const float blendGap,
-					float* powerOutput,
-					MechModel* mechModel)
-	{
-		const float deltaTime = currentTime - lastTime;
-		lastTime = currentTime;
-
-		const float distToTarget = fabs(targetPos - currentPos);
-
-		if (deltaTime == 0){
-			return false;
-		}
-		const float curSpeed = computeCurrentSpeed();
-		recordData(currentTime, currentPos);
-		lastPos = currentPos;
-
-		const float absCurSpeed = fabs(curSpeed);
-		if (distToTarget < stoppingDistanceTolerance && absCurSpeed < stoppingSpeedTolerance)
-		{
-			return true;
-		}
-
-		const float maxa = accelRate;
-		float futurePos = currentPos + (mechModel->GetMechanicalLag()*curSpeed);
-		float futureDistToTarget = targetPos-futurePos;
-		float targetSpeed = sqrt(2*maxa*abs(futureDistToTarget));
-		const float gap = blendGap;
-		if(futurePos > targetPos)
-		{
-			targetSpeed = targetSpeed * -1;
-		}
-
-		if(curSpeed < targetSpeed-gap)
-		{
-			*powerOutput = powerIfUnder;
-		}
-		else if(curSpeed >= targetSpeed-gap && curSpeed <= targetSpeed )
-		{
-			const float min = targetSpeed - gap;
-			const float max = targetSpeed;
-			float blend = (curSpeed-min)/(max-min);
-			//blending from max power and the movement model
-			*powerOutput = blendNum(powerIfUnder,mechModel->GetMotorPowerForSpeed(targetSpeed),blend,powerIfUnder,powerIfOver);
-		}
-		else if(curSpeed <= targetSpeed+gap && curSpeed > targetSpeed )
-		{
-			const float min = targetSpeed;
-			const float max = targetSpeed + gap;
-			float blend = (curSpeed-min)/(max-min);
-			//blending from max power and the movement model
-			*powerOutput = blendNum(mechModel->GetMotorPowerForSpeed(targetSpeed),powerIfOver,blend,powerIfUnder,powerIfOver);
-		}
-		else
-		{
-			*powerOutput = powerIfOver;
-		}
-		printf("%.2f \t %.2f \t %.2f \t %.2f \t %.2f  %.2f \n",
-					*powerOutput,
-					currentTime,
-					curSpeed,
-					currentPos,
-					targetSpeed,
-					futurePos);
-		return false;
-	}
-
-};
-
 
 class SimpleRobotDemo;
 void receiveTask(SimpleRobotDemo *myRobot);
@@ -645,6 +446,39 @@ public:
 		plw->AddSensor( "Turret", "Pot", &turretPot );
 		plw->AddActuator( "Turret", "PID", &turretController);
 	}
+	void DriveForwardTo(float speed, float distance)
+	{
+		bool tickInfo =true;
+		float targetPos;
+		EncoderLink enclnk(this);
+		DriveLink drvlnk(this);
+		targetPos=enclnk.PIDGet()+ distance;
+		RobotDriveModel model;
+		SmoothMotionManager distanceManager(enclnk.PIDGet(), (float) GetFPGATime() / 1000000.f);
+		while(IsAutonomous())
+		{
+			float motorPower;
+			bool stop = distanceManager.tick(enclnk.PIDGet(),
+					targetPos,
+					1.0, // power if going too slow
+					-0.4, // power if going too fast
+					6, // rate of acceleration
+					(float) GetFPGATime() / 1000000.f, // current time
+					0.05, // speed tolerance
+					0.05, // distance tolerance
+					0.5, // blendgap
+					&motorPower,
+					&model);
+			if(stop)
+			{
+				break;
+			}
+			myRobot.ArcadeDrive(motorPower,0.0);
+			Wait(0.002);
+		}
+
+	}
+
 	void DriveForward(float speed, float distance)
 	{
 		int cnt = 100;
@@ -889,99 +723,10 @@ public:
 
 		const float targetMeters = enclnk.PIDGet() + speedControlDistance;
 		//pid.Enable();
-
-		RobotDriveModel driveModel;
-		SmoothMotionManager robotDistance(enclnk.PIDGet(),(float)GetFPGATime()/1000000.0f);
-		while (IsAutonomous()&& IsEnabled())
-		{
-			Wait(.005);
-			const float currentTime =(float) GetFPGATime()/1000000.0f;
-			float motorPower = 0;
-
-			bool finished = robotDistance.tick(enclnk.PIDGet(),
-					targetMeters,
-					speedControlForwardValue,
-					speedControlReverseValue,
-					speedControlAccelRate,
-					currentTime,
-					speedControlSpeedTolerance,
-					0.015,
-					speedControlTargetGap,
-					&motorPower,
-					&driveModel);
-
-			if(finished) {
-				break;
-			}
-			myRobot.ArcadeDrive(motorPower, 0, false);
-			c++;
-			if(c % 20 == 0)
-			{
-				printf("targeted motor power was %.2f \n", motorPower);
-			}
-		}
+		DriveForwardTo(0,3);
 		myRobot.ArcadeDrive(0.0,0.0);
 
-/*
-		const float targetAngle = this->gyro->GetAngle() + 180;
-		RobotTurnModel turnModel;
-		SmoothMotionManager robotTurn(this->gyro->GetAngle(),(float)GetFPGATime()/1000000.0f);
-		while (IsAutonomous()&& IsEnabled())
-		{
-			Wait(.005);
-			const float currentTime =(float) GetFPGATime()/1000000.0f;
-			float motorPower = 0;
-			bool finished = robotTurn.tick(this->gyro->GetAngle(),
-					targetAngle,
-					speedControlForwardValue,
-					speedControlReverseValue,
-					speedControlAccelRate,
-					currentTime,
-					speedControlSpeedTolerance,
-					0.5,
-					&motorPower,
-					&turnModel);
 
-			if(finished) {
-				break;
-			}
-			myRobot.ArcadeDrive(0, motorPower, false);
-			c++;
-			if(c % 20 == 0)
-			{
-				//printf("turning: targeted motor power was %.2f \n", motorPower);
-			}
-		}*/
-		myRobot.ArcadeDrive(0, 0, false);
-
-
-		/*SmoothMotionManager turretPosition(turretPot.GetVoltage(),(float)GetFPGATime()/1000000.0f);
-		while (IsAutonomous()&& IsEnabled())
-		{
-			Wait(.005);
-			const float currentTime =(float) GetFPGATime()/1000000.0f;
-			float motorPower = 0;
-			bool finished = turretPosition.tick(turretPot.GetVoltage(),
-					2.0,
-					speedControlForwardValue,
-					speedControlReverseValue,
-					speedControlAccelRate,
-					currentTime,
-					speedControlSpeedTolerance,
-					0.01,
-					&motorPower);
-
-			if(finished) {
-				break;
-			}
-			turretControl(motorPower);
-			c++;
-			if(c % 20 == 0)
-			{
-				printf("targeted motor power was %.2f \n", motorPower);
-			}
-		}
-		turret.Set(0);*/
 		Wait(0.25);
 	}
 

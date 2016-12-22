@@ -104,6 +104,7 @@ float getSpeedOfPoints(const deque<timeDistance>& data)
 	}
 	bool SmoothMotionManager::tick(const float currentPos,
 					const float targetPos,
+					const float endSpeed,
 					const float powerIfUnder,
 					const float powerIfOver,
 					const float accelRate,
@@ -114,6 +115,7 @@ float getSpeedOfPoints(const deque<timeDistance>& data)
 					float* powerOutput,
 					MechModel* mechModel)
 	{
+		*powerOutput = 0;
 		const float deltaTime = currentTime - lastTime;
 		lastTime = currentTime;
 
@@ -128,8 +130,13 @@ float getSpeedOfPoints(const deque<timeDistance>& data)
 		lastPos = currentPos;
 
 		const float absCurSpeed = fabs(curSpeed);
-		if (distToTarget < stoppingDistanceTolerance && absCurSpeed < stoppingSpeedTolerance)
+
+		const bool isGoodDistance = distToTarget < stoppingDistanceTolerance;
+		const bool isGoodSpeed = absCurSpeed < stoppingSpeedTolerance || endSpeed != 0;
+
+		if (isGoodDistance && isGoodSpeed)
 		{
+
 			// achieved target: tell the caller we're done
 			return true;
 		}
@@ -137,12 +144,12 @@ float getSpeedOfPoints(const deque<timeDistance>& data)
 		const float maxa = accelRate;
 		float futurePos = currentPos + (mechModel->GetMechanicalLag()*curSpeed);
 		float futureDistToTarget = targetPos-futurePos;
-		float targetSpeedForDecel = sqrt(2*maxa*abs(futureDistToTarget));
+		float targetSpeedForDecel = sqrt(pow(endSpeed,2)+2*maxa*abs(futureDistToTarget));
 		float secPassed = currentTime-initTime;
 		float targetSpeedForAcel = maxa*secPassed;
 		float targetSpeed = min(targetSpeedForDecel, targetSpeedForAcel);
 
-		printf("%08.2f  %08.2f  %08.2f  %08.2f \n",targetSpeedForDecel,secPassed,targetSpeedForAcel,targetSpeed);
+		//printf("%08.2f  %08.2f  %08.2f  %08.2f \n",targetSpeedForDecel,secPassed,targetSpeedForAcel,targetSpeed);
 
 		// In-progress: attempting to keep wheels from spinning
 		//targetSpeed = max(targetSpeed,lastSpeed-maxa*deltaTime);

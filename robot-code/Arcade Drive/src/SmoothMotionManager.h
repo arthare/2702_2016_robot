@@ -63,6 +63,7 @@ public:
 	//tick returns true when you've gotten where you want to be
 	bool tick(const float currentPos,
 					const float targetPos,
+					const float endSpeed,
 					const float powerIfUnder,
 					const float powerIfOver,
 					const float accelRate,

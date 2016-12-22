@@ -8,6 +8,7 @@
 #include <math.h>
 #include <mutex>
 #include "SmoothMotionManager.h"
+#include "FastGyro.h"
 using namespace std;
 
 class SimpleRobotDemo;
@@ -282,7 +283,7 @@ class SimpleRobotDemo: public SampleRobot {
 	//	DigitalInput leftencA;
 	//	DigitalInput leftencB;
 
-	Gyro* gyro;
+	FastGyro* gyro;
 	float targetVolts; //the target pot reading the turret want to achieve
 #if PRACTICE_ROBOT
 	Task networkTask;
@@ -371,7 +372,7 @@ public:
 		networkTask.Start((UINT32)this);
 		gyro = new Gyro(GYRO_ANALOG_CHANNEL);
 #else
-		gyro = new AnalogGyro(GYRO_ANALOG_CHANNEL);
+		gyro = new FastGyro(GYRO_ANALOG_CHANNEL);
 		leftencoder.SetReverseDirection(true);
 		rightencoder.SetReverseDirection(true);
 #endif
@@ -446,8 +447,124 @@ public:
 		plw->AddSensor( "Turret", "Pot", &turretPot );
 		plw->AddActuator( "Turret", "PID", &turretController);
 	}
-	void DriveForwardTo(float speed, float distance)
+	void CurveTo(float radius, float degrees)
+	{//targetPos is desired heading in degrees
+		EncoderLink enclnk(this);
+		float forwardPower = 1.0;
+		float backwardsPower = -1.0;
+		const float initialGyroAngle = gyro->GetAngle();
+		const float initialDistance = enclnk.PIDGet();
+		if (0 > initialGyroAngle)
+		{
+			float temp = forwardPower;
+			forwardPower = -backwardsPower;
+			backwardsPower = -temp;
+		}
+		bool tickInfo =true;
+		RobotTurnModel model;
+		SmoothMotionManager turnManager(gyro->GetAngle(), (float) GetFPGATime() / 1000000.f);
+		RobotDriveModel distanceModel;
+		SmoothMotionManager distanceManager(enclnk.PIDGet(), (float) GetFPGATime() / 1000000.f);
+		const float totalDistanceToDrive =2*3.14159265358979323846264338327950*radius*(abs(degrees)/360);
+		while(IsAutonomous() && IsEnabled())
+		{
+			float distanceDriven = enclnk.PIDGet()-initialDistance;
+			float pctDistanceDriven =distanceDriven/totalDistanceToDrive;
+			float targetDegrees = pctDistanceDriven * degrees + initialGyroAngle;
+			float motorPower;
+			float forwardMotorPower;
+			bool stop = turnManager.tick(gyro->GetAngle(),
+					targetDegrees,
+					0,
+					forwardPower, // power if going too slow
+					backwardsPower, // power if going too fast
+				900, // rate of acceleration
+					(float) GetFPGATime() / 1000000.f, // current time
+					10, // speed tolerance
+					5, // distance tolerance
+					60, // blendgap
+					&motorPower,
+					&model);
+
+			float driveMotorPower = 1.0;
+			float driveReverseMotorPower = -0.1;
+			if(abs(targetDegrees - gyro->GetAngle()) > 20)
+			{
+				// we're way off target for turning, let's slow down so we can correct.
+				driveMotorPower = 0.3;
+				driveReverseMotorPower = -0.2;
+			}
+
+			bool distanceStop = distanceManager.tick(enclnk.PIDGet(),
+				totalDistanceToDrive + initialDistance,
+				3,
+				driveMotorPower, // power if going too slow
+				driveReverseMotorPower, // power if going too fast
+				2, // rate of acceleration
+				(float) GetFPGATime() / 1000000.f, // current time
+				0.2, // speed tolerance
+				0.15, // distance tolerance
+				0.5, // blendgap
+				&forwardMotorPower,
+				&distanceModel);
+			printf("td=%.1f gyro=%.1f turn=%.1f pct=%.1f dis=%.1f deg=%.1f init=%.1f\n", targetDegrees, gyro->GetAngle(), motorPower, pctDistanceDriven, distanceDriven, degrees, initialGyroAngle);
+			if(distanceStop && stop)
+				{
+					break;
+				}
+			myRobot.ArcadeDrive(forwardMotorPower,motorPower);
+			Wait(0.002);
+
+		}
+		printf("blahblahblah\n");
+		myRobot.ArcadeDrive(0,0,false);
+	}
+	void TurnTo(float targetPos)
+	{//targetPos is desired heading in degrees
+		float forwardPower = 1.0;
+		float backwardsPower = -0.4;
+		if (targetPos < gyro->GetAngle())
+		{
+			float temp = forwardPower;
+			forwardPower = -backwardsPower;
+			backwardsPower = -temp;
+		}
+		bool tickInfo =true;
+		RobotTurnModel model;
+		SmoothMotionManager turnManager(gyro->GetAngle(), (float) GetFPGATime() / 1000000.f);
+		while(IsAutonomous())
+		{
+			float motorPower;
+			bool stop = turnManager.tick(gyro->GetAngle(),
+					targetPos,
+					0,
+					forwardPower, // power if going too slow
+					backwardsPower, // power if going too fast
+				900, // rate of acceleration
+					(float) GetFPGATime() / 1000000.f, // current time
+					5, // speed tolerance
+					5, // distance tolerance
+					30, // blendgap
+					&motorPower,
+					&model);
+			if(stop)
+			{
+				break;
+			}
+			myRobot.ArcadeDrive(0.0,motorPower);
+			Wait(0.002);
+		}
+	}
+	void DriveForwardTo(float speed, float distance, float heading)
 	{
+		float forwardPower = 1.0;
+		float backwardsPower = -0.4;
+		if (distance < 0)
+		{
+			float temp = forwardPower;
+			forwardPower = -backwardsPower;
+			backwardsPower = -temp;
+		}
 		bool tickInfo =true;
 		float targetPos;
 		EncoderLink enclnk(this);
@@ -455,16 +572,32 @@ public:
 		targetPos=enclnk.PIDGet()+ distance;
 		RobotDriveModel model;
 		SmoothMotionManager distanceManager(enclnk.PIDGet(), (float) GetFPGATime() / 1000000.f);
+		RobotTurnModel turnModel;
+		SmoothMotionManager turnManager(gyro->GetAngle(),(float) GetFPGATime() / 1000000.f);
 		while(IsAutonomous())
 		{
+			float turnMotorPower;
+			bool turnStop = turnManager.tick(gyro->GetAngle(),
+				heading,
+				0, // endSpeed
+				0.5, // power if going too slow
+				-0.5, // power if going too fast
+				900, // rate of acceleration
+				(float) GetFPGATime() / 1000000.f, // current time
+				5, // speed tolerance
+				5, // distance tolerance
+				30, // blendgap
+				&turnMotorPower,
+				&turnModel);
 			float motorPower;
 			bool stop = distanceManager.tick(enclnk.PIDGet(),
 					targetPos,
-					1.0, // power if going too slow
-					-0.4, // power if going too fast
-					6, // rate of acceleration
+					speed,
+					forwardPower, // power if going too slow
+					backwardsPower, // power if going too fast
+					2, // rate of acceleration
 					(float) GetFPGATime() / 1000000.f, // current time
-					0.05, // speed tolerance
+					0.1, // speed tolerance
 					0.05, // distance tolerance
 					0.5, // blendgap
 					&motorPower,
@@ -473,7 +606,8 @@ public:
 			{
 				break;
 			}
-			myRobot.ArcadeDrive(motorPower,0.0);
+			float error = heading - gyro->GetAngle();
+			myRobot.ArcadeDrive(motorPower, turnMotorPower);
 			Wait(0.002);
 		}
 
@@ -723,9 +857,39 @@ public:
 
 		const float targetMeters = enclnk.PIDGet() + speedControlDistance;
 		//pid.Enable();
-		DriveForwardTo(0,3);
-		myRobot.ArcadeDrive(0.0,0.0);
+		/*for (int i = 0; i < 10; i++)
+		{
+			DriveForwardTo(0,3);
+			DriveForwardTo(0,-3);
+		}*/
+		const float ahead = gyro->GetAngle();
+		const float west = ahead - 90;
+		const float east = ahead + 90;
+		const float south = ahead - 180;
+		DriveForwardTo(5,1.3,ahead);
+		CurveTo(1.7, -1110);
+		if(false) // don't want to do laps for now
+		{ //dirves a 3/1 meter lap
+			myRobot.ArcadeDrive(0,0,false);
 
+
+			for(int i = 0 ; i < 5; i++)
+			{
+				DriveForwardTo(0,3.48,ahead);
+				TurnTo(west);
+				DriveForwardTo(0,2.37,west);
+				TurnTo(ahead);
+				DriveForwardTo(0,-3.48,ahead);
+				TurnTo(west);
+				DriveForwardTo(0,-2.37,west);
+				TurnTo(ahead);
+
+
+				//TurnTo(west);
+				//bTurnTo(ahead);
+				myRobot.ArcadeDrive(0.0,0.0);
+			}
+		}
 
 		Wait(0.25);
 	}
@@ -900,6 +1064,7 @@ public:
 		{
 			updateNetworkData();
 
+			printf("gyro\t%f\n", gyro->GetRate());
 			bool opButtonClicked[12] = {0};
 			bool driveButtonClicked[12] = {0};
 			for (int x = 1;x < 12; x++)
@@ -1032,17 +1197,17 @@ public:
 			int curentTime = GetFPGATime();
 
 
-			float dt = (curentTime - lastTime)/1000000.0f;
-			if(dt>0.025)
+			/*float dt = (curentTime - lastTime)/1000000.0f;
+			if(dt>0.5)
 			{
 				float thisPos = gyro->GetAngle();
 				float thisSpeed = (thisPos - lastTurretPos)/dt;
 				float thisAcc = (thisSpeed - lastTurretSpeed)/dt;
-				printf("current acelleration  %f \n",thisAcc);
+				printf("current acelleration  %f \n",thisPos);
 				lastTurretPos = thisPos;
 				lastTurretSpeed = thisSpeed;
 				lastTime = curentTime;
-			}
+			}*/
 			float kidMode = (-opStick.GetZ()+1)/2;
 			myRobot.ArcadeDrive(driveStick.GetY() * kidMode, driveStick.GetX() * kidMode); // drive with arcade style (use right stick)
 			static int highStartedAt = GetFPGATime();
